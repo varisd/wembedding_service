@@ -26,9 +26,47 @@ class WEmbeddings:
         "bert-base-multilingual-uncased-last4": ("bert-base-multilingual-uncased", -4, None),
         "robeczech-base-last4": ("ufal/robeczech-base", -4, None),
         "xlm-roberta-base-last4": ("xlm-roberta-base", -4, None),
+        "fasttext-cs-vectors": ("facebook/fasttext-cs-vectors", None, None),
+        "fasttext-en-vectors": ("facebook/fasttext-en-vectors", None, None),
     }
 
     MAX_SUBWORDS_PER_SENTENCE = 510
+
+    class _FasttextModel:
+        def __init__(self, fasttext_model, loader_lock):
+           self._model_loaded = False
+           self._fasttext_model_name = fasttext_model
+           self._loader_lock = loader_lock
+
+        def load(self):
+            if self._model_loaded: return
+            with self._loader_lock:
+                import fasttext
+                import transformers
+                from huggingface_hub import hf_hub_download
+
+                if self._model_loaded: return
+
+                self.tonekizer = None
+                model_path = hf_hub_download(
+                    repo_id=self._fasttext_model_name,
+                    filename="model.bin".format(
+                        self._fasttext_model_name.split("-")[1]
+                    )
+                )
+                self._fasttext_model = fasttext.load_model(model_path)
+
+                def compute_embeddings(sentences):
+                    embeddings = []
+                    for sentence in sentences:
+                        embeddings.append([
+                            self._fasttext_model.get_word_vector(word)
+                            for word in sentence
+                        ])
+                    return embeddings
+
+                self.compute_embeddings = compute_embeddings
+                self._model_loaded = True
 
     class _Model:
         """Construct a tokenizer and transformers model graph."""
@@ -59,7 +97,6 @@ class WEmbeddings:
                         (tf.maximum(subwords, 0), tf.cast(tf.not_equal(subwords, -1), tf.int32))
                     ).hidden_states
                     subword_embeddings = tf.math.reduce_mean(subword_embeddings_layers[self._layer_start:self._layer_end], axis=0)
-
                     # Average subwords (word pieces) word embeddings for each token
                     def average_subwords(embeddings_and_segments):
                         subword_embeddings, segments = embeddings_and_segments
@@ -86,11 +123,32 @@ class WEmbeddings:
 
         loader_lock = threading.Lock()
         self._models = {}
-        for model_name, (transformers_model, layer_start, layer_end) in self.MODELS_MAP.items():
-            self._models[model_name] = self._Model(transformers_model, layer_start, layer_end, loader_lock)
+        for model_name, (model, layer_start, layer_end) in self.MODELS_MAP.items():
+            if "fasttext" in model_name:
+                self._models[model_name] = self._FasttextModel(
+                    model, loader_lock
+                )
+            else:
+                self._models[model_name] = self._Model(
+                    model, layer_start, layer_end, loader_lock
+                )
 
             if model_name in preload_models or "all" in preload_models:
                 self._models[model_name].load()
+
+    def _compute_embeddings_fasttext(self, model, sentences):
+        model.load()
+        embeddings = model.compute_embeddings(sentences)
+
+        embeddings_dim = embeddings[0][0].shape[0]
+        np_embeddings_arr = [
+            np.full([len(sentence_emb), embeddings_dim], np.float)
+            for sentence_emb in embeddings
+        ]
+        for i, sentence_emb in enumerate(embeddings):
+            for j, word_emb in enumerate(sentence_emb):
+                np_embeddings_arr[i][j, :] = embeddings[i][j]
+        return np_embeddings_arr
 
     def compute_embeddings(self, model, sentences):
         """Computes word embeddings.
@@ -106,6 +164,12 @@ class WEmbeddings:
 
         embeddings = []
         if sentences:
+            if 'fasttext' in model:
+                return self._compute_embeddings_fasttext(
+                    self._models[model],
+                    sentences
+                )
+
             model = self._models[model]
             model.load()
 
